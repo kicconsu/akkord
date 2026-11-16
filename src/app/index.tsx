@@ -1,98 +1,64 @@
-import * as Device from 'expo-device';
-import { Platform, StyleSheet } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { useEffect, useState } from 'react';
+import { ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { AnimatedIcon } from '@/components/animated-icon';
-import { HintRow } from '@/components/hint-row';
-import { ThemedText } from '@/components/themed-text';
-import { ThemedView } from '@/components/themed-view';
-import { WebBadge } from '@/components/web-badge';
-import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
+import { PlayerControls } from '@/components/PlayerControls';
+import { audioEngine } from '@/audio/engine';
+import { BUNDLED_TRACKS } from '@/audio/tracks';
+import { useAudioFeatures } from '@/audio/useAudioFeatures';
+import { DebugOverlay } from '@/viz/DebugOverlay';
+import { compileVisualizer } from '@/viz/effects';
+import { ShaderCanvas } from '@/viz/ShaderCanvas';
+import { VISUALIZERS } from '@/viz/shaders';
 
-function getDevMenuHint() {
-  if (Platform.OS === 'web') {
-    return <ThemedText type="small">use browser devtools</ThemedText>;
-  }
-  if (Device.isDevice) {
-    return (
-      <ThemedText type="small">
-        shake device or press <ThemedText type="code">m</ThemedText> in terminal
-      </ThemedText>
-    );
-  }
-  const shortcut = Platform.OS === 'android' ? 'cmd+m (or ctrl+m)' : 'cmd+d';
+export default function PlayerScreen() {
+  const insets = useSafeAreaInsets();
+  const features = useAudioFeatures();
+  const [debug, setDebug] = useState(false);
+  const [vizIndex, setVizIndex] = useState(0);
+
+  // A proper picker arrives in step 5; for now the controls' pill cycles through VISUALIZERS.
+  const viz = VISUALIZERS[vizIndex % VISUALIZERS.length];
+  const compiled = compileVisualizer(viz);
+
+  useEffect(() => {
+    // The engine is a singleton, so don't reload after Fast Refresh remounts this screen.
+    if (audioEngine.getState().status === 'idle') void audioEngine.load(BUNDLED_TRACKS[0]);
+  }, []);
+
   return (
-    <ThemedText type="small">
-      press <ThemedText type="code">{shortcut}</ThemedText>
-    </ThemedText>
-  );
-}
+    <View style={styles.root}>
+      {compiled.effect ? (
+        // Keyed by id: each visualizer has its own child textures, so remount rather than patch.
+        <ShaderCanvas key={viz.id} viz={viz} effect={compiled.effect} features={features} />
+      ) : (
+        <ScrollView
+          style={StyleSheet.absoluteFill}
+          contentContainerStyle={{ paddingTop: insets.top + 16, padding: 16 }}
+        >
+          <Text style={styles.errorTitle}>Shader “{viz.name}” failed to compile</Text>
+          <Text style={styles.errorBody}>{compiled.error}</Text>
+          <Text style={styles.errorHint}>Full numbered source is in the Metro console.</Text>
+        </ScrollView>
+      )}
 
-export default function HomeScreen() {
-  return (
-    <ThemedView style={styles.container}>
-      <SafeAreaView style={styles.safeArea}>
-        <ThemedView style={styles.heroSection}>
-          <AnimatedIcon />
-          <ThemedText type="title" style={styles.title}>
-            Welcome to&nbsp;Expo
-          </ThemedText>
-        </ThemedView>
+      {debug && <DebugOverlay features={features} style={[styles.debug, { top: insets.top + 12 }]} />}
 
-        <ThemedText type="code" style={styles.code}>
-          get started
-        </ThemedText>
-
-        <ThemedView type="backgroundElement" style={styles.stepContainer}>
-          <HintRow
-            title="Try editing"
-            hint={<ThemedText type="code">src/app/index.tsx</ThemedText>}
-          />
-          <HintRow title="Dev tools" hint={getDevMenuHint()} />
-          <HintRow
-            title="Fresh start"
-            hint={<ThemedText type="code">npm run reset-project</ThemedText>}
-          />
-        </ThemedView>
-
-        {Platform.OS === 'web' && <WebBadge />}
-      </SafeAreaView>
-    </ThemedView>
+      <PlayerControls
+        vizName={viz.name}
+        onNextViz={() => setVizIndex((i) => (i + 1) % VISUALIZERS.length)}
+        debug={debug}
+        onToggleDebug={() => setDebug((d) => !d)}
+        style={{ paddingBottom: insets.bottom + 16 }}
+      />
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    justifyContent: 'center',
-    flexDirection: 'row',
-  },
-  safeArea: {
-    flex: 1,
-    paddingHorizontal: Spacing.four,
-    alignItems: 'center',
-    gap: Spacing.three,
-    paddingBottom: BottomTabInset + Spacing.three,
-    maxWidth: MaxContentWidth,
-  },
-  heroSection: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    flex: 1,
-    paddingHorizontal: Spacing.four,
-    gap: Spacing.four,
-  },
-  title: {
-    textAlign: 'center',
-  },
-  code: {
-    textTransform: 'uppercase',
-  },
-  stepContainer: {
-    gap: Spacing.three,
-    alignSelf: 'stretch',
-    paddingHorizontal: Spacing.three,
-    paddingVertical: Spacing.four,
-    borderRadius: Spacing.four,
-  },
+  root: { flex: 1, backgroundColor: '#000' },
+  debug: { position: 'absolute', left: 12, right: 12 },
+  errorTitle: { color: '#f87171', fontSize: 16, fontWeight: '600', marginBottom: 8 },
+  errorBody: { color: '#fecaca', fontFamily: 'monospace', fontSize: 12 },
+  errorHint: { color: '#9ca3af', fontSize: 12, marginTop: 12 },
 });

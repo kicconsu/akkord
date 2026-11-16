@@ -41,3 +41,6 @@ example
 # generated native folders
 /ios
 /android
+
+# PNGs written by `npm run check:shaders -- --png` and `npm run preview:shader`
+/shader-previews
