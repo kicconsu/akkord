@@ -98,6 +98,7 @@ Each visualizer is a module exporting `{ id, name, sksl, children }`. The regist
 - Full-screen fragment shaders run per pixel. Phones with 3x density are expensive, so render the shader canvas at **0.5–0.75 scale and upscale** when needed.
 - Keep raymarch/FBM iteration counts small, and **test on a low-end Android device early**.
 - **Character-grid shaders do their per-cell work once per pixel.** A 7×11 dp cell is about 700 physical pixels at 3×, all repeating the same maths. The galaxy is the heaviest shader so far (fbm + noise + about 10 transcendental calls per pixel). The fix is two passes: render one value per cell (glyph index + colour) into a grid-sized texture with an offscreen surface on the UI thread, then sample it in a light glyph pass. That cuts the per-cell work by roughly 700×.
+- **Implemented:** `ShaderCanvas` lays the native canvas out at `scale` × the screen size and enlarges it with a view transform (`transformOrigin: 'left top'`), while a `<Group transform={[{ scale }]}>` inside keeps the shader's coordinates in full-size dp. The GPU shades scale² as many pixels. Each visualizer sets a `renderScale` (Rubik 0.75, the rest 1) and a `minRenderScale` (glyph shaders 0.75). The Quality setting in the visualizer sheet multiplies it by 1 / 0.75 / 0.5.
 - No React state in the frame loop: shared values only.
 - Reuse typed arrays (`Float32Array`) for analyser reads, with no per-frame allocations.
 
@@ -122,9 +123,12 @@ src/viz/glyphAtlas.ts           glyph atlas layout math (pure, shared with check
 src/viz/useSpectrumTexture.ts   features → uSpectrum SkImage on the UI thread
 src/viz/ChildShaders.tsx        runtime-built child textures (glyph atlas)
 src/viz/effects.ts              compile + cache + error reporting
-src/viz/ShaderCanvas.tsx        <Canvas><Fill><Shader>children</Shader></Fill></Canvas> + uniforms
+src/viz/ShaderCanvas.tsx        <Canvas><Fill><Shader>children</Shader></Fill></Canvas> + uniforms + resolution scaling
+src/viz/quality.ts              Quality setting → effective render scale per visualizer (pure)
 src/viz/DebugOverlay.tsx        plain-Skia bands/meters/beat view for validating data
-src/components/PlayerControls.tsx  title, seek bar, play/pause, debug toggle
+src/components/PlayerControls.tsx  title (opens tracks), seek bar, play/pause, visualizer pill, debug toggle
+src/components/Sheet.tsx        bottom sheet + rows/sections/segmented control for the pickers
+src/audio/library.ts            bundled + user-picked tracks (expo-document-picker), session-only
 scripts/check-shaders.ts        compile + contract-check shaders in Node via CanvasKit (+ quick previews)
 scripts/preview-shader.ts       contact sheets of a visualizer at real moments of a track
 scripts/lib/skia-node.ts        CanvasKit harness mirroring ShaderCanvas (uniforms, uSpectrum, glyph atlases)
@@ -135,12 +139,12 @@ assets/audio/                   bundled tracks
 ```
 
 ## 9. Build order
-1. ✅ (code side) Scaffold the Expo TS app. Add Skia, Reanimated, audio-api and document-picker, then create the dev build on a device. *The on-device dev build is still pending: see Status.*
+1. ✅ Scaffold the Expo TS app. Add Skia, Reanimated, audio-api and document-picker, then create the dev build on a device. *Dev build running on an Android emulator (Windows); see Status.*
 2. ✅ (code side) Audio engine: load a bundled track, play/pause/seek.
 3. ✅ (code side) Analyser and feature extraction. Debug-render the bands as plain Skia rects to validate the data.
 4. ✅ (code side) `ShaderCanvas` with the uniform contract, plus the first shader (spectrum bars in SkSL).
-5. Add 2–3 more shaders and a picker UI. Add the file picker for user tracks. *(Partly done: the new shader inputs and the ASCII visualizer exist; a pill in the controls cycles visualizers until the real picker lands.)*
-6. Performance pass (resolution scaling, low-end Android).
+5. ✅ Add 2–3 more shaders and a picker UI. Add the file picker for user tracks. *(ASCII spectrum, ASCII galaxy and Rubik cube; visualizer sheet; track sheet with "Open audio files…".)*
+6. ✅ (code side) Performance pass: per-visualizer render scale plus a Quality setting. *Still to do: measure fps on a low-end Android phone, and the two-pass glyph rendering from section 6 if the ASCII shaders are too slow.*
 
 ## Verification
 - Dev build runs on iOS and Android devices. A bundled track plays, pauses and seeks.
@@ -154,6 +158,11 @@ assets/audio/                   bundled tracks
 - Local Android build issues hit so far:
   - **JRE instead of JDK:** `Toolchain ... does not provide the required capabilities: [JAVA_COMPILER]`. Fix: install `openjdk-21-jdk` and set `JAVA_HOME`.
   - **Incomplete NDK:** `CXX1214 ... User has minSdkVersion 22 but library was built for 24`. Every Gradle module resolves to minSdk 24. The NDK at `~/Android/Sdk/ndk/27.1.12297006` had no `meta/` folder (no `platforms.json`), and without it AGP falls back to platform 22 for native code. Fix: reinstall that NDK through Android Studio's SDK Manager and confirm `meta/platforms.json` exists.
+- **Windows (Android Studio emulator), first successful device build:**
+  - The SDK's CMake 3.22.1 ships ninja 1.10.2, which fails on object paths over 260 characters (`Filename longer than 260 characters`, in `react-native-gesture-handler` codegen; the path was 321 characters) even with `LongPathsEnabled` on. Fix: install `cmake/3.31.6` with `sdkmanager` (its ninja 1.12.1 handles long paths) and point Gradle at it with `cmake.dir=C:/Users/<you>/AppData/Local/Android/Sdk/cmake/3.31.6` in `android/local.properties`. That file is gitignored and is not regenerated by prebuild, but a clean prebuild removes `android/`, so it has to be added again.
+  - Use Android Studio's bundled JDK (`JAVA_HOME=<Android Studio>/jbr`).
+  - The dev client couldn't reach Metro at `10.0.2.2`. `adb reverse tcp:8081 tcp:8081` and opening `exp+akkord://expo-development-client/?url=http%3A%2F%2Flocalhost%3A8081` works.
+  - First build ≈ 30 min (NDK + C++), incremental ≈ 15 min. JS-only changes need only `npx expo start --dev-client`.
 - EAS cloud builds are the alternative: `npx eas-cli@latest login`, then `npm run build:dev:android` / `build:dev:ios`. EAS will ask for a package name / bundle id; prebuild currently falls back to `com.anonymous.akkord`.
 
 **Steps 2–4: engine, features, first shader** (code done; not yet run on a device)
@@ -217,3 +226,20 @@ assets/audio/                   bundled tracks
   2. The strokes are legible at 7×11 dp.
   3. The shockwave fires on kicks, and the rotation speeds up with louder music.
 
+**Rubik cube + pickers + resolution scaling** (code done; run on the Android emulator)
+- **Rubik cube** (`src/viz/shaders/rubik.ts`): a raymarched 3×3×3 cube.
+  - It spins on its tilted vertical axis, at a constant rate plus a part driven by `uPhase`. Both rates are wrap-safe at 3600.
+  - Each beat twists one layer a quarter turn. `uBeatCount` picks the axis, layer and direction, and the turn eases in as `uBeat` decays.
+  - The 54 stickers each glow with one slice of the spectrum (bass on the white face, treble on the blue one). Bass pushes the cubies apart and swells the cube, and beats flash the stickers. Treble sharpens the highlights.
+  - A spectrum halo circles the cube, mirrored so the bass sits at the top.
+  - Cost: three box SDFs per step, at most 64 steps, only inside a bounding sphere; rendered at 75%.
+- **Visualizer sheet:** the pill opens a list of all visualizers with their effective resolution, and the Quality control.
+- **Track sheet:** tapping the title opens it: "Open audio files…" (multi-select, `audio/*`, copied to cache), the bundled tracks, and the files picked this session. Choosing a track loads it and starts playing.
+- Checked:
+  - `check:shaders` passes for all four shaders. `preview:shader rubik` across the sweep and the groove shows the twists, gaps and halo.
+  - `tsc`, lint and Prettier are clean.
+  - On the Pixel_7 emulator (API 37): the bundle loads, the sheets open, Rubik renders at 75% and fills the screen, the cube reacts to the test track, and the system file picker opens and cancels cleanly.
+- **What to verify on a real phone:**
+  1. Frame rate of Rubik and galaxy on a low-end Android device, at each Quality level.
+  2. Playing an MP3/AAC picked from the device, including a long one (memory use of full decoding).
+  3. That the upscaled canvas has no seam or offset on iOS.

@@ -175,4 +175,6 @@ half4 main(float2 fragCoord) {
 }
 `,
   [ATLAS],
+  // Glyphs blur when upscaled, so the quality setting may not shrink this one much.
+  { minRenderScale: 0.75 },
 );
