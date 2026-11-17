@@ -44,12 +44,19 @@ This is plain math over a few hundred floats per frame and is cheap in JS.
 - 64 bands, 30 Hz–16 kHz. A band narrower than one FFT bin samples the spectrum at its center by interpolation. A wider band takes the loudest bin inside it.
 - Normalization: dB plus a tilt of **+3 dB/octave around 1 kHz**, mapped from **−85..−30 dB** to 0..1. Without the tilt the treble barely moves.
 - Envelopes: attack 25 ms, release 220 ms. Energy is RMS mapped from −40..−4 dBFS.
-- Beat: positive spectral flux over 30–150 Hz. The threshold is the running mean + 1.5 × std-dev of the flux (1 s time constant) + 0.04. Minimum gap between beats is 220 ms, and the impulse decays with a 120 ms time constant.
+- Beat, in two stages (rewritten after a loud, compressed dubstep master, Skrillex's "Rock n Roll", lost most beats in its drops: the old flux on clamped 0..1 levels over 30–150 Hz was swamped by the wobble bass):
+  1. **Onsets.** SuperFlux in dB: each band is compared with the loudest of itself and its two neighbours in the previous frame, so pitch glides (wobble) don't count. There are two channels, kicks (30–200 Hz) and body (30 Hz–5 kHz, below the cymbals). Each channel's flux is divided by its own 4 s running mean (so mastering loudness doesn't matter), log-compressed (so one huge onset can't inflate the statistics), and tested against its own running mean + 1.5 × std-dev (1 s) + 0.5. While there is no tempo, kicks lead, and the body channel fires only after 1.5 s without a kick (music without drums).
+  2. **Tempo.** The onset curve (kicks ×2 + body) is resampled to 60 Hz into a 6 s buffer. Every 0.25 s, its autocorrelation over 70–180 BPM (with a bonus at the double lag and a broad prior around 120 BPM) picks the period, and a comb over the buffer picks the phase. When the normalised autocorrelation is above 0.3 (dropped below 0.2), beats lock to that grid. Onsets within ±70 ms of a grid beat fire it, onsets off the grid are ignored, and a grid beat with no onset fires by itself (a kick buried under bass). With no sound (energy < 0.05) the grid stops.
+  - Minimum gap between beats is 220 ms, and the impulse decays with a 120 ms time constant.
 - **Tuning evidence:** I fed the test track through a Node simulation of the Web Audio analyser (Blackman window, same smoothing). Results:
   - The sweep's peak band matched the expected frequency at every checkpoint.
   - All **32/32 kicks** were detected, with no extra triggers and about 17 ms (one frame) of lag.
   - A −95 dB floor missed 2 kicks.
   - `fftSize` 4096 separated the lows better but missed about half the beats.
+- **Re-tuning evidence (two-stage detector):**
+  - Test track: 32/32 kicks within −40..+60 ms, 1 extra trigger in the groove; it locks to 120 BPM after about 4 s of groove. The sine sweep now triggers about 6 times (a pure glide is a worst case).
+  - "Rock n Roll" (274 s, decoded from the MP3): locks to **128 BPM** wherever the drums play and unlocks in the two breakdowns. It gives 21–22 beats per 10 s in the drops (it gave 4–9 before), and the most common gap is 0.45–0.50 s.
+  - Pausing: at most one beat while the energy fades, then none.
 - Known limit: a 2048 FFT can't resolve the lowest bands individually, so a bass tone lights several neighbouring low bands. If that matters, a second analyser at 4096 could feed only the bands while beats stay on 2048.
 
 ## 4. Getting data into Skia every frame (the critical path)
@@ -98,6 +105,7 @@ Each visualizer is a module exporting `{ id, name, sksl, children }`. The regist
 - Full-screen fragment shaders run per pixel. Phones with 3x density are expensive, so render the shader canvas at **0.5–0.75 scale and upscale** when needed.
 - Keep raymarch/FBM iteration counts small, and **test on a low-end Android device early**.
 - **Character-grid shaders do their per-cell work once per pixel.** A 7×11 dp cell is about 700 physical pixels at 3×, all repeating the same maths. The galaxy is the heaviest shader so far (fbm + noise + about 10 transcendental calls per pixel). The fix is two passes: render one value per cell (glyph index + colour) into a grid-sized texture with an offscreen surface on the UI thread, then sample it in a light glyph pass. That cuts the per-cell work by roughly 700×.
+- **Implemented:** `ShaderCanvas` lays the native canvas out at `scale` × the screen size and enlarges it with a view transform (`transformOrigin: 'left top'`), while a `<Group transform={[{ scale }]}>` inside keeps the shader's coordinates in full-size dp. The GPU shades scale² as many pixels. Each visualizer sets a `renderScale` (Rubik 0.75, the rest 1) and a `minRenderScale` (glyph shaders 0.75). The Quality setting in the visualizer sheet multiplies it by 1 / 0.75 / 0.5.
 - No React state in the frame loop: shared values only.
 - Reuse typed arrays (`Float32Array`) for analyser reads, with no per-frame allocations.
 
@@ -122,9 +130,12 @@ src/viz/glyphAtlas.ts           glyph atlas layout math (pure, shared with check
 src/viz/useSpectrumTexture.ts   features → uSpectrum SkImage on the UI thread
 src/viz/ChildShaders.tsx        runtime-built child textures (glyph atlas)
 src/viz/effects.ts              compile + cache + error reporting
-src/viz/ShaderCanvas.tsx        <Canvas><Fill><Shader>children</Shader></Fill></Canvas> + uniforms
+src/viz/ShaderCanvas.tsx        <Canvas><Fill><Shader>children</Shader></Fill></Canvas> + uniforms + resolution scaling
+src/viz/quality.ts              Quality setting → effective render scale per visualizer (pure)
 src/viz/DebugOverlay.tsx        plain-Skia bands/meters/beat view for validating data
-src/components/PlayerControls.tsx  title, seek bar, play/pause, debug toggle
+src/components/PlayerControls.tsx  title (opens tracks), seek bar, play/pause, visualizer pill, debug toggle
+src/components/Sheet.tsx        bottom sheet + rows/sections/segmented control for the pickers
+src/audio/library.ts            bundled + user-picked tracks (expo-document-picker), session-only
 scripts/check-shaders.ts        compile + contract-check shaders in Node via CanvasKit (+ quick previews)
 scripts/preview-shader.ts       contact sheets of a visualizer at real moments of a track
 scripts/lib/skia-node.ts        CanvasKit harness mirroring ShaderCanvas (uniforms, uSpectrum, glyph atlases)
@@ -135,12 +146,12 @@ assets/audio/                   bundled tracks
 ```
 
 ## 9. Build order
-1. ✅ (code side) Scaffold the Expo TS app. Add Skia, Reanimated, audio-api and document-picker, then create the dev build on a device. *The on-device dev build is still pending: see Status.*
+1. ✅ Scaffold the Expo TS app. Add Skia, Reanimated, audio-api and document-picker, then create the dev build on a device. *Dev build running on an Android emulator (Windows); see Status.*
 2. ✅ (code side) Audio engine: load a bundled track, play/pause/seek.
 3. ✅ (code side) Analyser and feature extraction. Debug-render the bands as plain Skia rects to validate the data.
 4. ✅ (code side) `ShaderCanvas` with the uniform contract, plus the first shader (spectrum bars in SkSL).
-5. Add 2–3 more shaders and a picker UI. Add the file picker for user tracks. *(Partly done: the new shader inputs and the ASCII visualizer exist; a pill in the controls cycles visualizers until the real picker lands.)*
-6. Performance pass (resolution scaling, low-end Android).
+5. ✅ Add 2–3 more shaders and a picker UI. Add the file picker for user tracks. *(ASCII spectrum, ASCII galaxy and Rubik cube; visualizer sheet; track sheet with "Open audio files…".)*
+6. ✅ (code side) Performance pass: per-visualizer render scale plus a Quality setting. *Still to do: measure fps on a low-end Android phone, and the two-pass glyph rendering from section 6 if the ASCII shaders are too slow.*
 
 ## Verification
 - Dev build runs on iOS and Android devices. A bundled track plays, pauses and seeks.
@@ -154,6 +165,11 @@ assets/audio/                   bundled tracks
 - Local Android build issues hit so far:
   - **JRE instead of JDK:** `Toolchain ... does not provide the required capabilities: [JAVA_COMPILER]`. Fix: install `openjdk-21-jdk` and set `JAVA_HOME`.
   - **Incomplete NDK:** `CXX1214 ... User has minSdkVersion 22 but library was built for 24`. Every Gradle module resolves to minSdk 24. The NDK at `~/Android/Sdk/ndk/27.1.12297006` had no `meta/` folder (no `platforms.json`), and without it AGP falls back to platform 22 for native code. Fix: reinstall that NDK through Android Studio's SDK Manager and confirm `meta/platforms.json` exists.
+- **Windows (Android Studio emulator), first successful device build:**
+  - The SDK's CMake 3.22.1 ships ninja 1.10.2, which fails on object paths over 260 characters (`Filename longer than 260 characters`, in `react-native-gesture-handler` codegen; the path was 321 characters) even with `LongPathsEnabled` on. Fix: install `cmake/3.31.6` with `sdkmanager` (its ninja 1.12.1 handles long paths) and point Gradle at it with `cmake.dir=C:/Users/<you>/AppData/Local/Android/Sdk/cmake/3.31.6` in `android/local.properties`. That file is gitignored and is not regenerated by prebuild, but a clean prebuild removes `android/`, so it has to be added again.
+  - Use Android Studio's bundled JDK (`JAVA_HOME=<Android Studio>/jbr`).
+  - The dev client couldn't reach Metro at `10.0.2.2`. `adb reverse tcp:8081 tcp:8081` and opening `exp+akkord://expo-development-client/?url=http%3A%2F%2Flocalhost%3A8081` works.
+  - First build ≈ 30 min (NDK + C++), incremental ≈ 15 min. JS-only changes need only `npx expo start --dev-client`.
 - EAS cloud builds are the alternative: `npx eas-cli@latest login`, then `npm run build:dev:android` / `build:dev:ios`. EAS will ask for a package name / bundle id; prebuild currently falls back to `com.anonymous.akkord`.
 
 **Steps 2–4: engine, features, first shader** (code done; not yet run on a device)
@@ -217,3 +233,21 @@ assets/audio/                   bundled tracks
   2. The strokes are legible at 7×11 dp.
   3. The shockwave fires on kicks, and the rotation speeds up with louder music.
 
+**Rubik cube + pickers + resolution scaling** (code done; run on the Android emulator)
+- **Rubik cube** (`src/viz/shaders/rubik.ts`): a raymarched 3×3×3 cube.
+  - It spins on its tilted vertical axis, at a constant rate plus a part driven by `uPhase`. Both rates are wrap-safe at 3600.
+  - It is always scrambled, and solves itself one move per beat in a loop. Each cycle is 22 beats: a fast whirl applies a 20-move hashed scramble on the first beat, each of the next 20 beats undoes one move (the quarter turn eases in as `uBeat` decays, done in about 0.23 s), and the cube then stays solved for one beat with a halo flare. The app starts scrambled.
+  - Stateless: the state is a function of `uBeatCount`. To colour a sticker, each pixel walks its cell and normal back through the moves applied so far (at most 20 rotations, only on pixels that hit the cube). Consecutive scramble moves never share an axis, so no move cancels the previous one. Rendered frames at the end of one beat and the start of the next are pixel-identical.
+  - The 54 sticker positions each glow with one slice of the spectrum (bass on the white face, treble on the blue one). Bass pushes the cubies apart and swells the cube, and beats flash the stickers. Treble sharpens the highlights.
+  - A spectrum halo circles the cube, mirrored so the bass sits at the top.
+  - Cost: three box SDFs per step, at most 64 steps, only inside a bounding sphere; rendered at 75%.
+- **Visualizer sheet:** the pill opens a list of all visualizers with their effective resolution, and the Quality control.
+- **Track sheet:** tapping the title opens it: "Open audio files…" (multi-select, `audio/*`, copied to cache), the bundled tracks, and the files picked this session. Choosing a track loads it and starts playing.
+- Checked:
+  - `check:shaders` passes for all four shaders. `preview:shader rubik` across the sweep and the groove shows the twists, gaps and halo.
+  - `tsc`, lint and Prettier are clean.
+  - On the Pixel_7 emulator (API 37): the bundle loads, the sheets open, Rubik renders at 75% and fills the screen, the cube reacts to the test track, and the system file picker opens and cancels cleanly.
+- **What to verify on a real phone:**
+  1. Frame rate of Rubik and galaxy on a low-end Android device, at each Quality level.
+  2. Playing an MP3/AAC picked from the device, including a long one (memory use of full decoding).
+  3. That the upscaled canvas has no seam or offset on iOS.

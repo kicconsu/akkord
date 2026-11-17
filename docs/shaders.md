@@ -76,6 +76,12 @@ The other prelude helpers are `palette(t, a, b, c, d)` (a cosine colour palette)
   - Flow-aligned glyphs: picking `- / | \` from the arm's tangent projected to the screen.
   - A shockwave ring driven by `uBeat`'s decay, and a smooth push on each beat from `uBeatCount - uBeat`.
   - Wrap-safe rotation rates, and glyph indices generated from the atlas string so they can't drift out of sync.
+- **`rubik.ts`:**
+  - Raymarching an SDF in SkSL: camera, bounding-sphere early-out, tetrahedral normals, and global state set once per pixel.
+  - Splitting the cube into three slabs along the twist axis, so twisting a layer is just rotating its points (3 box SDFs per step instead of 27).
+  - State without state: the scramble → solve cycle is a pure function of `uBeatCount`, and `1 - uBeat` eases each move. Sticker colours come from walking the hit point back through the hashed move list.
+  - Continuity: the end of one beat and the start of the next render the same image, because a move that is fully done equals the next state with that move just starting.
+  - A rotation-matrix inverse built by negating angles (SkSL has no `transpose()`), and `renderScale: 0.75`.
 
 ## Adding a texture to a shader
 
@@ -130,7 +136,8 @@ It has to go in four places, or the app throws at runtime:
 - The shader runs for every pixel on every frame, even when paused, because `uTime` keeps the canvas redrawing.
 - Costs multiply: each `band()`/`bandAt()` call is a 64-step loop, and each `noise()` call is four hash calculations. Prefer `spectrum()`, and keep total loop iterations per pixel in the tens.
 - Character-grid shaders (`ascii`, `galaxy`) compute their per-cell values in every pixel of the cell: a 7×11 dp cell is about 700 physical pixels on a 3× screen, all repeating the same noise and maths. Expensive per-cell work costs far more than it looks. The real fix is two passes, one value per cell rendered into a small texture and then a glyph pass (see step 6 in `dev-plan.md`).
-- There's no render-resolution scaling yet (step 6 in `dev-plan.md`), so try heavy shaders on a low-end Android phone early.
+- Heavy shaders can render below screen resolution: pass `{ renderScale: 0.75 }` (or lower) as the fifth argument to `defineVisualizer`. The canvas is upscaled, and the shader still sees full-size dp in `fragCoord` and `uResolution`, so no code changes. The user's Quality setting (High / Balanced / Saver) multiplies it by 1 / 0.75 / 0.5. Glyph shaders set `minRenderScale` so text stays legible.
+- Still try heavy shaders on a low-end Android phone early.
 
 ### What the preview doesn't tell you
 

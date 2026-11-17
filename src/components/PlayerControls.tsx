@@ -14,7 +14,10 @@ import { usePlaybackPosition, usePlayerState } from '../audio/usePlayer';
 
 interface Props {
   vizName: string;
-  onNextViz: () => void;
+  /** Opens the visualizer picker. */
+  onOpenVisualizers: () => void;
+  /** Opens the track library. */
+  onOpenTracks: () => void;
   debug: boolean;
   onToggleDebug: () => void;
   style?: StyleProp<ViewStyle>;
@@ -27,7 +30,14 @@ const formatTime = (s: number) => {
 
 /** Track title, seek bar and transport buttons. It re-renders at ~10 Hz for the position,
  *  so it is kept separate from the canvas. */
-export function PlayerControls({ vizName, onNextViz, debug, onToggleDebug, style }: Props) {
+export function PlayerControls({
+  vizName,
+  onOpenVisualizers,
+  onOpenTracks,
+  debug,
+  onToggleDebug,
+  style,
+}: Props) {
   const { status, track, duration, error } = usePlayerState();
   const position = usePlaybackPosition();
   const [scrub, setScrub] = useState<number | null>(null);
@@ -45,21 +55,26 @@ export function PlayerControls({ vizName, onNextViz, debug, onToggleDebug, style
   return (
     <View style={[styles.root, style]}>
       <View style={styles.header}>
-        <View style={styles.titles}>
+        <Pressable
+          onPress={onOpenTracks}
+          style={({ pressed }) => [styles.titles, pressed && styles.pressed]}
+          accessibilityRole="button"
+          accessibilityLabel={`Track: ${track?.title ?? 'none'}. Tap to choose another`}
+        >
           <Text style={styles.title} numberOfLines={1}>
-            {track?.title ?? 'No track'}
+            {track?.title ?? 'No track'} <Text style={styles.chevron}>▾</Text>
           </Text>
           {subtitle && (
             <Text style={[styles.subtitle, status === 'error' && styles.error]} numberOfLines={2}>
               {subtitle}
             </Text>
           )}
-        </View>
+        </Pressable>
         <Pressable
-          onPress={onNextViz}
+          onPress={onOpenVisualizers}
           style={styles.pill}
           accessibilityRole="button"
-          accessibilityLabel={`Visualizer: ${vizName}. Tap for next`}
+          accessibilityLabel={`Visualizer: ${vizName}. Tap to choose`}
         >
           <Text style={styles.pillText} numberOfLines={1}>
             {vizName} ›
@@ -136,6 +151,7 @@ const styles = StyleSheet.create({
   header: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   titles: { flex: 1 },
   title: { color: '#fff', fontSize: 16, fontWeight: '600' },
+  chevron: { color: '#9ca3af', fontSize: 13 },
   subtitle: { color: '#9ca3af', fontSize: 13, marginTop: 2 },
   error: { color: '#f87171' },
   pill: {

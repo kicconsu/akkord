@@ -28,6 +28,18 @@ export interface VisualizerDef {
   sksl: string;
   /** Bound after PRELUDE_CHILDREN, in this order; must match the body's `uniform shader`s. */
   children: ChildSpec[];
+  /** Fraction of the screen resolution to render at on the "High" quality setting (0..1].
+   *  Heavy shaders (raymarching) default lower; the canvas is upscaled to fill the screen. */
+  renderScale: number;
+  /** Lowest scale the quality setting may push this shader to (e.g. keep glyphs legible). */
+  minRenderScale: number;
+}
+
+export interface VisualizerOptions {
+  /** Default 1. */
+  renderScale?: number;
+  /** Default 0.4. */
+  minRenderScale?: number;
 }
 
 /** Child shaders declared by the prelude. Skia binds children in declaration order, and a
@@ -116,9 +128,12 @@ export const defineVisualizer = (
   name: string,
   body: string,
   children: ChildSpec[] = [],
+  { renderScale = 1, minRenderScale = 0.4 }: VisualizerOptions = {},
 ): VisualizerDef => ({
   id,
   name,
   sksl: `${UNIFORMS}${HELPERS}${body}`,
   children,
+  renderScale,
+  minRenderScale: Math.min(minRenderScale, renderScale),
 });
