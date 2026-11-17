@@ -79,8 +79,8 @@ The other prelude helpers are `palette(t, a, b, c, d)` (a cosine colour palette)
 - **`rubik.ts`:**
   - Raymarching an SDF in SkSL: camera, bounding-sphere early-out, tetrahedral normals, and global state set once per pixel.
   - Splitting the cube into three slabs along the twist axis, so twisting a layer is just rotating its points (3 box SDFs per step instead of 27).
-  - Beat-driven events: `uBeatCount` picks which layer turns and in which direction, and `1 - uBeat` eases the quarter turn.
-  - Seamless repeats: colours come from the surface normal, so a finished quarter turn looks exactly like the solved cube.
+  - State without state: the scramble → solve cycle is a pure function of `uBeatCount`, and `1 - uBeat` eases each move. Sticker colours come from walking the hit point back through the hashed move list.
+  - Continuity: the end of one beat and the start of the next render the same image, because a move that is fully done equals the next state with that move just starting.
   - A rotation-matrix inverse built by negating angles (SkSL has no `transpose()`), and `renderScale: 0.75`.
 
 ## Adding a texture to a shader

@@ -63,14 +63,36 @@ export interface FeatureConfig {
   /** Loudness range (RMS in dBFS) mapped to energy 0..1. */
   energyFloorDb: number;
   energyCeilDb: number;
-  /** Beat detection: spectral flux over `beatHz` against an adaptive threshold. */
-  beatHz: [number, number];
-  /** Threshold = mean + sensitivity × std-dev of recent flux. Lower fires more often. */
+  /** Beat detection, stage 1 (onsets): positive spectral flux in dB, SuperFlux style (each band
+   *  is compared with the loudest of itself and its neighbours in the previous frame, which
+   *  ignores pitch glides such as wobble bass). Two channels, each with its own threshold, and a
+   *  beat fires when either crosses it: `beatLowHz` (kicks) and `beatBodyHz` (snares, plucks,
+   *  vocals; it stops below the cymbals so off-beat hats don't count). */
+  beatLowHz: [number, number];
+  beatBodyHz: [number, number];
+  /** The flux is divided by its own running mean over this many seconds, so loud, compressed
+   *  masters and quiet recordings behave the same. */
+  beatNormTime: number;
+  /** Onset threshold = mean + sensitivity × std-dev of the recent normalised flux. Lower fires
+   *  more often. */
   beatSensitivity: number;
-  /** Absolute flux floor so near-silence never triggers. */
+  /** Absolute floor on the normalised flux, so steady sound never triggers. */
   beatMinFlux: number;
   /** Time constant (s) of the running flux statistics. */
   beatHistory: number;
+  /** Stage 2 (tempo): the onset curve's autocorrelation over the last `tempoWindow` seconds
+   *  picks a beat period in this BPM range (weighted toward `tempoPriorBpm`), and a comb over
+   *  the same window finds its phase. */
+  tempoMinBpm: number;
+  tempoMaxBpm: number;
+  tempoPriorBpm: number;
+  tempoWindow: number;
+  /** Normalised autocorrelation needed to trust the tempo, and below which it is dropped. */
+  tempoConfidenceOn: number;
+  tempoConfidenceOff: number;
+  /** While the tempo is trusted, onsets only count within this many seconds of the beat grid,
+   *  and a grid beat with no onset near it fires on its own (a kick buried under bass). */
+  beatTolerance: number;
   /** Minimum time (s) between beats. */
   beatMinInterval: number;
   /** Decay time constant (s) of the beat impulse. */
@@ -95,17 +117,58 @@ export const DEFAULT_FEATURE_CONFIG: Omit<FeatureConfig, 'sampleRate' | 'fftSize
   trebleHz: [4000, 20000],
   energyFloorDb: -40,
   energyCeilDb: -4,
-  beatHz: [30, 150],
+  beatLowHz: [30, 200],
+  beatBodyHz: [30, 5000],
+  beatNormTime: 4,
   beatSensitivity: 1.5,
-  beatMinFlux: 0.04,
+  beatMinFlux: 0.5,
   beatHistory: 1.0,
+  tempoMinBpm: 70,
+  tempoMaxBpm: 180,
+  tempoPriorBpm: 120,
+  tempoWindow: 6,
+  tempoConfidenceOn: 0.3,
+  tempoConfidenceOff: 0.2,
+  beatTolerance: 0.07,
   beatMinInterval: 0.22,
   beatDecay: 0.12,
   phaseBaseSpeed: 0.2,
   phaseEnergySpeed: 1.0,
 };
 
+/** dB floor for onset detection, so silence → sound is a finite jump. */
+const ONSET_FLOOR_DB = -100;
+
+/** The onset curve is resampled to this fixed rate for tempo analysis. */
+const ODF_RATE = 60;
+
 const clamp01 = (v: number) => (v > 0 ? (v < 1 ? v : 1) : 0); // also maps NaN to 0
+
+/** One onset detector: flux normalised by its own running mean, against its own adaptive
+ *  threshold. Separate channels keep a broadband snare from raising the bar for a lone kick. */
+class OnsetChannel {
+  private norm = 0;
+  private mean = 0;
+  private variance = 0;
+  /** Normalised flux from the last update. */
+  value = 0;
+  /** Whether the last update crossed the threshold. */
+  onset = false;
+
+  update(rawFlux: number, dt: number, c: FeatureConfig): void {
+    this.norm += (rawFlux - this.norm) * (1 - Math.exp(-dt / c.beatNormTime));
+    // Log-compressed, so one huge onset (the first kick after a quiet passage) can't inflate the
+    // statistics and hide the next few beats.
+    const v = Math.log1p(rawFlux / (this.norm + 0.5));
+    this.value = v;
+    this.onset = v > this.mean + c.beatSensitivity * Math.sqrt(this.variance) + c.beatMinFlux;
+    // Statistics update after the test, so an onset can't raise its own threshold.
+    const a = 1 - Math.exp(-dt / c.beatHistory);
+    const diff = v - this.mean;
+    this.mean += a * diff;
+    this.variance += a * (diff * diff - this.variance);
+  }
+}
 
 export class FeatureExtractor {
   readonly config: FeatureConfig;
@@ -120,7 +183,9 @@ export class FeatureExtractor {
   beatCount = 0;
 
   private readonly raw: Float32Array;
-  private readonly prevRaw: Float32Array;
+  /** Band levels in dB (floored, no tilt) for onset detection: this frame and the previous. */
+  private readonly bandDb: Float32Array;
+  private readonly prevDb: Float32Array;
   /** Fractional FFT bin range [lo, hi) and center per band. */
   private readonly binLo: Float32Array;
   private readonly binHi: Float32Array;
@@ -129,10 +194,26 @@ export class FeatureExtractor {
   private readonly bassRange: [number, number];
   private readonly midRange: [number, number];
   private readonly trebleRange: [number, number];
-  private readonly beatRange: [number, number];
-  private fluxMean = 0;
-  private fluxVar = 0;
+  private readonly beatLowRange: [number, number];
+  private readonly beatBodyRange: [number, number];
+  private readonly lowOnsets = new OnsetChannel();
+  private readonly bodyOnsets = new OnsetChannel();
   private sinceBeat = Infinity;
+  private sinceLowOnset = Infinity;
+  /** Last `tempoWindow` seconds of the normalised onset curve at ODF_RATE (ring buffer). */
+  private readonly odf: Float32Array;
+  private odfHead = 0;
+  private odfFilled = 0;
+  private odfClock = 0;
+  private sinceTempo = Infinity;
+  private confidence = 0;
+  /** Beat period in seconds, or 0 while the tempo isn't trusted. */
+  private period = 0;
+  /** Seconds until the next grid beat (valid while period > 0). */
+  private untilGrid = Infinity;
+  /** The grid beat nearest to now has already fired (from an onset or by itself). */
+  private gridSlotUsed = false;
+  private scratch = new Float32Array(0);
   private silentFreq: Float32Array | null = null;
   private silentTime: Float32Array | null = null;
 
@@ -144,7 +225,8 @@ export class FeatureExtractor {
 
     this.bands = new Float32Array(bandCount);
     this.raw = new Float32Array(bandCount);
-    this.prevRaw = new Float32Array(bandCount);
+    this.bandDb = new Float32Array(bandCount).fill(ONSET_FLOOR_DB);
+    this.prevDb = new Float32Array(bandCount).fill(ONSET_FLOOR_DB);
     this.binLo = new Float32Array(bandCount);
     this.binHi = new Float32Array(bandCount);
     this.binCenter = new Float32Array(bandCount);
@@ -176,7 +258,9 @@ export class FeatureExtractor {
     this.bassRange = range(this.config.bassHz);
     this.midRange = range(this.config.midHz);
     this.trebleRange = range(this.config.trebleHz);
-    this.beatRange = range(this.config.beatHz);
+    this.beatLowRange = range(this.config.beatLowHz);
+    this.beatBodyRange = range(this.config.beatBodyHz);
+    this.odf = new Float32Array(Math.round(this.config.tempoWindow * ODF_RATE));
   }
 
   /**
@@ -211,8 +295,9 @@ export class FeatureExtractor {
         for (let k = k0; k <= k1; k++) if (freqDb[k] > db) db = freqDb[k];
       }
       const level = clamp01((db + this.tiltDb[i] - floorDb) / dbSpan);
-      this.prevRaw[i] = this.raw[i];
       this.raw[i] = level;
+      this.prevDb[i] = this.bandDb[i];
+      this.bandDb[i] = db > ONSET_FLOOR_DB ? db : ONSET_FLOOR_DB; // also maps -Infinity/NaN
       const cur = this.bands[i];
       this.bands[i] = cur + (level - cur) * (level > cur ? aAttack : aRelease);
     }
@@ -270,30 +355,196 @@ export class FeatureExtractor {
     return s / (end - start);
   }
 
+  /** Current tempo in BPM, or 0 while it isn't trusted. For debugging and tests. */
+  get bpm(): number {
+    return this.period > 0 ? 60 / this.period : 0;
+  }
+
   private detectBeat(dt: number): void {
-    const { beatSensitivity, beatMinFlux, beatHistory, beatMinInterval, beatDecay } = this.config;
-    const [start, end] = this.beatRange;
-    let flux = 0;
-    for (let i = start; i < end; i++) {
-      const d = this.raw[i] - this.prevRaw[i];
-      if (d > 0) flux += d;
+    const { bandCount, beatMinInterval, beatDecay, beatTolerance } = this.config;
+
+    // Onset strength (SuperFlux) per channel.
+    let body = 0;
+    let low = 0;
+    const [lowStart, lowEnd] = this.beatLowRange;
+    const [bodyStart, bodyEnd] = this.beatBodyRange;
+    for (let i = Math.min(lowStart, bodyStart); i < Math.max(lowEnd, bodyEnd); i++) {
+      let ref = this.prevDb[i];
+      if (i > 0 && this.prevDb[i - 1] > ref) ref = this.prevDb[i - 1];
+      if (i < bandCount - 1 && this.prevDb[i + 1] > ref) ref = this.prevDb[i + 1];
+      const d = this.bandDb[i] - ref;
+      if (d > 0) {
+        if (i >= bodyStart && i < bodyEnd) body += d;
+        if (i >= lowStart && i < lowEnd) low += d;
+      }
     }
-    flux /= Math.max(end - start, 1);
+    this.lowOnsets.update(low / Math.max(lowEnd - lowStart, 1), dt, this.config);
+    this.bodyOnsets.update(body / Math.max(bodyEnd - bodyStart, 1), dt, this.config);
+    const onset = this.lowOnsets.onset || this.bodyOnsets.onset;
+    this.sinceLowOnset = this.lowOnsets.onset ? 0 : this.sinceLowOnset + dt;
+
+    // Tempo curve: kicks carry the pulse in most music, so the low channel counts double.
+    this.pushOdf(2 * this.lowOnsets.value + this.bodyOnsets.value, dt);
+    this.sinceTempo += dt;
+    if (this.sinceTempo >= 0.25) {
+      this.sinceTempo = 0;
+      this.estimateTempo();
+    }
 
     this.sinceBeat += dt;
-    const threshold = this.fluxMean + beatSensitivity * Math.sqrt(this.fluxVar) + beatMinFlux;
-    if (flux > threshold && this.sinceBeat >= beatMinInterval) {
+
+    // Paused or silent: the buffer still holds the old rhythm, so the grid must not keep going.
+    if (this.period > 0 && this.energy < 0.05) this.dropTempo();
+
+    let fire = false;
+    if (this.period > 0) {
+      // Tempo-locked: onsets count only near the grid, and a grid beat with none fires itself.
+      this.untilGrid -= dt;
+      while (this.untilGrid < -beatTolerance) {
+        this.untilGrid += this.period;
+        this.gridSlotUsed = false;
+      }
+      if (!this.gridSlotUsed && this.sinceBeat >= beatMinInterval) {
+        const nearGrid = Math.abs(this.untilGrid) <= beatTolerance;
+        if ((onset && nearGrid) || this.untilGrid <= 0) {
+          fire = true;
+          this.gridSlotUsed = true;
+        }
+      }
+    } else {
+      // No tempo yet: kicks lead. The body channel (snares, plucks…) only drives beats in music
+      // that has had no kick for a while, so bass notes and fills don't add off-beat triggers.
+      const kickless = this.sinceLowOnset > 1.5;
+      fire =
+        (this.lowOnsets.onset || (kickless && this.bodyOnsets.onset)) && this.sinceBeat >= beatMinInterval;
+    }
+
+    if (fire) {
       this.beat = 1;
       this.sinceBeat = 0;
       this.beatCount++;
     } else {
       this.beat *= Math.exp(-dt / beatDecay);
     }
+  }
 
-    // Update running statistics after the test, so an onset can't raise its own threshold.
-    const a = 1 - Math.exp(-dt / beatHistory);
-    const diff = flux - this.fluxMean;
-    this.fluxMean += a * diff;
-    this.fluxVar += a * (diff * diff - this.fluxVar);
+  /** Appends the onset value at a fixed rate, whatever the frame rate. */
+  private pushOdf(value: number, dt: number): void {
+    const step = 1 / ODF_RATE;
+    this.odfClock += dt;
+    const steps = Math.floor(this.odfClock / step);
+    this.odfClock -= steps * step;
+    // Capped, so a long stall (app in background) can't loop for long.
+    for (let n = Math.min(steps, this.odf.length); n > 0; n--) {
+      this.odf[this.odfHead] = value;
+      this.odfHead = (this.odfHead + 1) % this.odf.length;
+      if (this.odfFilled < this.odf.length) this.odfFilled++;
+    }
+  }
+
+  /** The onset value k samples ago (0 = newest). */
+  private odfAt(k: number): number {
+    const len = this.odf.length;
+    return this.odf[(((this.odfHead - 1 - k) % len) + len) % len];
+  }
+
+  /** Autocorrelation of the onset curve picks the period; a comb over it picks the phase. */
+  private estimateTempo(): void {
+    const { tempoMinBpm, tempoMaxBpm, tempoPriorBpm, tempoConfidenceOn, tempoConfidenceOff } = this.config;
+    const tol = this.config.beatTolerance;
+    const n = this.odfFilled;
+    if (this.energy < 0.05) {
+      this.dropTempo(); // see detectBeat: no grid without sound
+      return;
+    }
+    const minLag = Math.floor((60 / tempoMaxBpm) * ODF_RATE);
+    const maxLag = Math.ceil((60 / tempoMinBpm) * ODF_RATE);
+    if (n < maxLag * 3) {
+      this.dropTempo();
+      return;
+    }
+
+    // Mean-removed copy, newest first.
+    const x = this.scratch.length === n ? this.scratch : (this.scratch = new Float32Array(n));
+    let mean = 0;
+    for (let k = 0; k < n; k++) mean += this.odfAt(k);
+    mean /= n;
+    let ac0 = 0;
+    for (let k = 0; k < n; k++) {
+      x[k] = this.odfAt(k) - mean;
+      ac0 += x[k] * x[k];
+    }
+    if (ac0 < 1e-6 * n) {
+      this.confidence = 0;
+      this.dropTempo(); // flat: silence or a steady tone
+      return;
+    }
+    const r = (lag: number): number => {
+      let s = 0;
+      for (let k = 0; k + lag < n; k++) s += x[k] * x[k + lag];
+      return s / ac0;
+    };
+
+    // Normalised autocorrelation per lag, plus its double (a real beat repeats there too),
+    // weighted by a broad log-normal tempo prior.
+    let bestLag = 0;
+    let bestScore = -Infinity;
+    let bestR = 0;
+    for (let lag = minLag; lag <= maxLag; lag++) {
+      const rl = r(lag);
+      const r2 = 2 * lag < n ? r(2 * lag) : 0;
+      const bpm = (60 * ODF_RATE) / lag;
+      const prior = Math.exp(-0.5 * (Math.log2(bpm / tempoPriorBpm) / 0.7) ** 2);
+      const score = (rl + 0.5 * r2) * (0.5 + 0.5 * prior);
+      if (score > bestScore) {
+        bestScore = score;
+        bestLag = lag;
+        bestR = rl;
+      }
+    }
+
+    // Confidence with hysteresis, so the mode doesn't flicker.
+    this.confidence += (bestR - this.confidence) * 0.5;
+    const trusted =
+      this.period > 0 ? this.confidence >= tempoConfidenceOff : this.confidence >= tempoConfidenceOn;
+    if (!trusted) {
+      this.dropTempo();
+      return;
+    }
+
+    // Sub-sample period: parabola through the neighbouring lags.
+    let lag = bestLag;
+    if (bestLag > minLag && bestLag < maxLag) {
+      const a = r(bestLag - 1);
+      const c = r(bestLag + 1);
+      const denom = a - 2 * bestR + c;
+      if (denom < 0) lag = bestLag + (0.5 * (a - c)) / denom;
+    }
+
+    // Phase: the offset (samples back) whose comb collects the most onset strength.
+    let bestPhase = 0;
+    let bestSum = -Infinity;
+    for (let ph = 0; ph < Math.ceil(lag); ph++) {
+      let sum = 0;
+      for (let t = ph; t < n; t += lag) sum += x[Math.round(t)] ?? 0;
+      if (sum > bestSum) {
+        bestSum = sum;
+        bestPhase = ph;
+      }
+    }
+
+    const period = lag / ODF_RATE;
+    let next = -bestPhase / ODF_RATE; // the latest comb beat, now or in the past
+    while (next < -tol) next += period;
+    // The slot counts as used if the last beat fired close to it.
+    this.gridSlotUsed = Math.abs(next + this.sinceBeat) <= tol;
+    this.period = period;
+    this.untilGrid = next;
+  }
+
+  private dropTempo(): void {
+    this.period = 0;
+    this.untilGrid = Infinity;
+    this.gridSlotUsed = false;
   }
 }
