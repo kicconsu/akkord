@@ -1,15 +1,20 @@
 import { useEffect, useState } from 'react';
 import { ScrollView, StyleSheet, Text, View } from 'react-native';
+
+//custom hooks
+import { pickAudioFiles, useLibrary } from '@/audio/library';
+import { useAudioFeatures } from '@/audio/useAudioFeatures';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+//components
 import { PlayerControls } from '@/components/PlayerControls';
 import { Segmented, Sheet, SheetRow, SheetSection } from '@/components/Sheet';
+
 import { audioEngine } from '@/audio/engine';
-import { pickAudioFiles, useLibrary } from '@/audio/library';
 import type { Track } from '@/audio/tracks';
 import { BUNDLED_TRACKS } from '@/audio/tracks';
-import { useAudioFeatures } from '@/audio/useAudioFeatures';
 import { usePlayerState } from '@/audio/usePlayer';
+
 import { DebugOverlay } from '@/viz/DebugOverlay';
 import { compileVisualizer } from '@/viz/effects';
 import { effectiveRenderScale, QUALITY_OPTIONS, type Quality } from '@/viz/quality';
@@ -22,8 +27,11 @@ export default function PlayerScreen() {
   const insets = useSafeAreaInsets();
   const features = useAudioFeatures();
   const library = useLibrary();
+
   const { track: currentTrack } = usePlayerState();
+
   const [debug, setDebug] = useState(false);
+
   const [vizId, setVizId] = useState(VISUALIZERS[0].id);
   const [quality, setQuality] = useState<Quality>('high');
   const [sheet, setSheet] = useState<OpenSheet>('none');

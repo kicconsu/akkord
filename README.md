@@ -1,56 +1,65 @@
-# Welcome to your Expo app 👋
+# Akkord
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+Visualizador de música para móvil (Expo / React Native). Reproduce archivos de audio locales, analiza el audio en vivo (FFT, bandas, beat) y usa esos datos para animar shaders SkSL dibujados con Skia (barras, galaxia, ASCII, cubo de Rubik).
 
-## Get started
+Enlace video youtube: https://youtu.be/S6da9RQC0_M
 
-1. Install dependencies
+## Cómo correrlo
 
-   ```bash
-   npm install
-   ```
-
-2. Start the app
-
-   ```bash
-   npx expo start
-   ```
-
-In the output, you'll find options to open the app in a
-
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **src/app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
+La app usa módulos nativos (`react-native-audio-api`, Skia), por lo que **no funciona en Expo Go**: necesita un development build.
 
 ```bash
-npm run reset-project
+npm install
+npm run android   # compila e instala el build de desarrollo en un dispositivo/emulador Android
 ```
 
-This command will move the starter code to the **example** directory and create a blank **src/app** directory where you can start developing.
+Otros scripts útiles: `npm start` (servidor Metro), `npm run ios`, `npm run lint`, `npm run typecheck`, `npm run check:shaders` (valida los shaders en Node).
 
-### Other setup steps
+## Estructura del proyecto
 
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
+```
+akkord/
+├── src/
+│   ├── app/            # Rutas (Expo Router)
+│   ├── audio/          # Reproducción y análisis de audio
+│   ├── viz/            # Visualizadores: Skia, shaders y texturas
+│   │   └── shaders/    # Un archivo por visualizador (SkSL)
+│   └── components/     # Componentes de UI reutilizables
+├── scripts/            # Herramientas de desarrollo en Node
+│   └── lib/            # Utilidades de los scripts
+├── docs/               # Documentación (guía para escribir shaders)
+├── assets/             # Imágenes, iconos y pistas de audio incluidas
+├── app.json            # Configuración de Expo
+├── eas.json            # Perfiles de build de EAS
+└── dev-plan.md         # Referencia técnica y plan de desarrollo
+```
 
-## Learn more
+### `src/app/`
+Pantallas con Expo Router. `_layout.tsx` define el layout raíz e `index.tsx` es la pantalla principal: junta el reproductor, el canvas del visualizador y los selectores de pista/visualizador.
 
-To learn more about developing your project with Expo, look at the following resources:
+### `src/audio/`
+Todo lo relacionado con el sonido.
+- `engine.ts`: grafo de audio (`AudioBufferSourceNode → AnalyserNode → salida`); decodifica el archivo completo y maneja play/pausa/seek.
+- `features.ts`: convierte la salida cruda del analizador en números útiles para shaders (64 bandas logarítmicas, graves/medios/agudos, energía y detección de beat con seguimiento de tempo). TypeScript puro, sin dependencias de RN.
+- `useAudioFeatures.ts`: bucle por frame que lee el analizador y publica las features en un shared value de Reanimated (sin re-renders de React).
+- `usePlayer.ts`: estado del reproductor (estado, pista, duración, posición).
+- `library.ts` / `tracks.ts`: pistas incluidas y archivos elegidos por el usuario con el selector de documentos.
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+### `src/viz/`
+Renderizado.
+- `ShaderCanvas.tsx`: canvas de Skia que ejecuta el shader activo y le pasa las uniforms de audio.
+- `shaders/`: un visualizador por archivo (`bars`, `galaxy`, `ascii`, `rubik`), registrados en `index.ts`; `common.ts` tiene el código SkSL compartido y `defineVisualizer`.
+- `effects.ts`: compila el SkSL (con errores legibles).
+- `spectrumTexture.ts` / `useSpectrumTexture.ts`: codifican el espectro como textura (`uSpectrum`) para los shaders.
+- `glyphAtlas.ts` / `ChildShaders.tsx`: atlas de glifos y texturas generadas en runtime (usado por el visualizador ASCII).
+- `quality.ts`: escala de resolución de render para controlar el rendimiento.
+- `DebugOverlay.tsx`: dibuja los valores crudos del audio para depurar.
 
-## Join the community
+### `src/components/`
+UI: `PlayerControls.tsx` (controles de reproducción) y `Sheet.tsx` (panel inferior modal para los selectores).
 
-Join our community of developers creating universal apps.
+### `scripts/`
+Herramientas con `tsx`/`node`, fuera de la app: `check-shaders.ts` (compila los shaders con CanvasKit), `preview-shader.ts` (renderiza una vista previa en Node, usando `lib/` para simular el analizador y un pool de workers) y `generate-test-track.mjs` (genera una pista de prueba).
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+### `docs/`
+`shaders.md` explica cómo crear un shader nuevo, qué significa cada uniform y los errores comunes.
